@@ -1,5 +1,7 @@
 # Weather Globe
 
+![Weather Globe: live satellite clouds, day and night, city temperatures](docs/screenshot.png)
+
 A spinnable 3D globe of the weather right now: the real day and night, clouds decoded from live geostationary
 satellite infrared, sharp land and cloud detail as you zoom in, and current temperatures for ~50 world cities.
 
