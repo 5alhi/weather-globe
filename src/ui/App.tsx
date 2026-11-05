@@ -12,13 +12,15 @@ import type { PlaceHit } from "../data/places"
 import { fetchPoint } from "../data/weather"
 import { issAt, parseTle } from "../geo/orbit"
 import { SearchBox } from "./SearchBox"
-import { IssPanel } from "./IssPanel"
+import { Menu } from "./Menu"
+import { InfoPanel } from "./InfoPanel"
+import { IssPanel, RIDE_SPEED, type FollowMode } from "./IssPanel"
 import { useWind, type WindState } from "../data/useWind"
 import { WIND_PARTS } from "../data/wind"
 import { satFieldOf, useSatellite, type SatState } from "../data/useSatellite"
 import { TileFetcher } from "../data/tileFetcher"
 import type { CityWeather } from "../data/weather"
-import { GlobeCameraController, clampLat, wrapLon, zoomed, type GlobeCamera } from "../globe/camera"
+import { GlobeCameraController, clampLat, reducedMotion, zoomed, type GlobeCamera } from "../globe/camera"
 import { REGIONS } from "../globe/regions"
 import type { DetailStatus } from "../globe/detail"
 import type { LabelBox } from "../globe/labels"
@@ -39,7 +41,7 @@ const UNIT_KEY = "weather-globe:unit"
 const WIND_KEY = "weather-globe:wind-on"
 /** the wind shown is the forecast's for the present, taken afresh this often */
 const WIND_FRAME_MS = 5 * 60_000
-const CAPTION_PX = 64
+const CAPTION_PX = 44
 /** a city clicked or played comes at least this close */
 const CITY_ZOOM = 2.4
 const MUSIC_ZOOM = 2
@@ -55,19 +57,15 @@ const ISS_SOURCE: Source<IssTle> = { key: "weather-globe:iss-tle:v1", everyMs: I
 /** a country found comes this close, a place found this close */
 const COUNTRY_ZOOM = 1.8
 const PLACE_ZOOM = 3.2
-/** following the ISS the camera is kept over it, moved on every FOLLOW_MS; a move of the user's own (the camera more
- *  than FOLLOW_SLIP_DEG from where it was put) ends the following */
-const FOLLOW_MS = 500
-const FOLLOW_SLIP_DEG = 0.4
+/** following the ISS, the camera is eased onto it at least this close */
 const FOLLOW_ZOOM = 1.6
-/** the follow starts with a flight there (it takes ~650 ms); one not landed by now was cut short by the user */
-const FOLLOW_START_MS = 900
 /** elements further than this from their epoch do not place the ISS (the model holds for a day or so either side) */
 const ISS_STALE_MS = 3 * 86_400_000
 type FoundPlace = Extract<PlaceHit, { kind: "place" }>
 const degrees = (c: number, unit: Unit): number => Math.round(unit === "F" ? cToF(c) : c)
 const tempText = (c: number, unit: Unit): string => `${degrees(c, unit)}°${unit}`
 const utcTime = (ms: number): string => new Date(ms).toISOString().slice(11, 16) + " UTC"
+const utcDay = (ms: number): string => new Date(ms).toISOString().slice(0, 16).replace("T", " ") + " UTC"
 /** a city's local clock time from its UTC offset */
 const localTime = (nowMs: number, offsetS: number): string => new Date(nowMs + offsetS * 1000).toISOString().slice(11, 16)
 
@@ -118,12 +116,14 @@ export function App() {
   const [touring, setTouring] = useState(false)
   const controller = useMemo(() => new GlobeCameraController(START, setTouring), [])
   useEffect(() => () => controller.dispose(), [controller])
+  // the globe opens turning, as the tour does (unless the viewer asked for less motion)
+  useEffect(() => { if (!reducedMotion()) controller.setTouring(true) }, [controller])
   const tiles = useMemo(() => new TileFetcher(), [])
   const [showClouds, setShowClouds] = useState(true)
   const [showWind, setShowWind] = useState(readWind)
   const [showIss, setShowIss] = useState(readIss)
   const [issOpen, setIssOpen] = useState(false)
-  const [following, setFollowing] = useState(false)
+  const [followMode, setFollowMode] = useState<FollowMode | null>(null)
   const [pin, setPin] = useState<FoundPlace | null>(null)
   const [pinWeather, setPinWeather] = useState<CityWeather | "failed" | null>(null)
   const [unit, setUnit] = useState<Unit>(readUnit)
@@ -137,6 +137,7 @@ export function App() {
   const [dockRef, dockBox] = useBox()
   const [panelRef, panelBox] = useBox()
   const [searchRef, searchBox] = useBox()
+  const [cornerRef, cornerBox] = useBox()
 
   const weather = useWeather()
   const sat = useSatellite(showClouds)
@@ -153,8 +154,28 @@ export function App() {
   const issLive = issEl && Math.abs(now - issEl.epochMs) < ISS_STALE_MS ? issEl : null
   const today = dayStartOf(now)
   const dayPick = useMemo(() => (issLive ? songOfDay(issLive, today, CITIES, TRACKS) : null), [issLive, today])
-  const followRef = useRef(false)
-  const follow = useCallback((on: boolean) => { followRef.current = on; setFollowing(on) }, [])
+  // the ISS's clock: the real one, or on the ride RIDE_SPEED times as fast from the moment the ride began
+  const issTime = useRef<{ mode: FollowMode | null; from: number }>({ mode: null, from: 0 })
+  const issClock = useCallback(() => {
+    const c = issTime.current
+    return c.mode === "ride" ? c.from + (Date.now() - c.from) * RIDE_SPEED : Date.now()
+  }, [])
+  const issLiveRef = useRef(issLive)
+  issLiveRef.current = issLive
+  const followCount = useRef(0)
+  /** Following the ISS: the camera kept over it (controller.follow) by the ride's clock or the real one; null stops. A
+   *  move of the user's own, a fly-to or the tour ends it too (the controller says so, and the clock is real again). */
+  const follow = useCallback((mode: FollowMode | null) => {
+    const el = issLiveRef.current
+    if (!mode || !el) { issTime.current = { mode: null, from: 0 }; controller.stopFollowing(); setFollowMode(null); return }
+    const id = ++followCount.current
+    issTime.current = { mode, from: mode === "ride" && issTime.current.mode === "ride" ? issTime.current.from : Date.now() }
+    setFollowMode(mode)
+    controller.follow(() => { const s = issAt(el, issClock()); return { lon: s.lon, lat: clampLat(s.lat) } }, Math.max(controller.camera.zoom, FOLLOW_ZOOM),
+      () => { if (followCount.current === id) { issTime.current = { mode: null, from: 0 }; setFollowMode(null) } })
+    // under reduced motion the camera only went there: nothing is followed, and the clock stays real
+    if (!controller.following) { issTime.current = { mode: null, from: 0 }; setFollowMode(null) }
+  }, [controller, issClock])
 
   const byId = useMemo(() => new Map((weather.cities ?? []).map((w) => [w.id, w])), [weather.cities])
   const cities: GlobeCity[] = useMemo(() => CITIES.map((c): GlobeCity => {
@@ -173,7 +194,7 @@ export function App() {
     const next = !showIss
     try { globalThis.localStorage?.setItem(ISS_KEY, next ? "1" : "0") } catch { /* the choice lasts this visit only */ }
     setShowIss(next)
-    if (!next) { setIssOpen(false); follow(false) }
+    if (!next) { setIssOpen(false); follow(null) }
   }
   const switchWind = () => setShowWind((on) => {
     try { globalThis.localStorage?.setItem(WIND_KEY, on ? "0" : "1") } catch { /* the choice lasts this visit only */ }
@@ -190,26 +211,27 @@ export function App() {
     setSelected(id)
     setPin(null)
     setIssOpen(false)
-    follow(false)
     flyToCity(id, CITY_ZOOM)
     // with the music on, a city plays its first song (unless one of its songs is on already)
     if (!musicMode) return
     const songs = tracksForCity(id, TRACKS, CITIES)
     if (songs.length && !songs.some((t) => t.id === playingId)) playId(songs[0].id)
-  }, [flyToCity, musicMode, playingId, playId, follow])
+  }, [flyToCity, musicMode, playingId, playId])
 
   // each new song's city comes into view (the city just clicked is on its way already)
   const trackCity = music.track?.city ?? null
   const selectedRef = useRef(selected)
   selectedRef.current = selected
+  // (not while a tour the user started turns the globe; the spin it opens with gives way)
+  const tourAsked = useRef(false)
   useEffect(() => {
-    if (trackCity && trackCity !== selectedRef.current && !controller.touring) flyToCity(trackCity, MUSIC_ZOOM)
+    if (trackCity && trackCity !== selectedRef.current && !(controller.touring && tourAsked.current)) flyToCity(trackCity, MUSIC_ZOOM)
   }, [trackCity, controller, flyToCity])
 
   // closing the player hands the keyboard focus back to the chip that opens it
   const musicChip = useRef<HTMLButtonElement>(null)
   const closeMusic = useCallback(() => { musicChip.current?.focus(); stop(); setMusicMode(false) }, [stop])
-  const findCity = useCallback((id: string) => { setSelected(id); setPin(null); setIssOpen(false); follow(false); flyToCity(id, CITY_ZOOM) }, [flyToCity, follow])
+  const findCity = useCallback((id: string) => { setSelected(id); setPin(null); setIssOpen(false); flyToCity(id, CITY_ZOOM) }, [flyToCity])
 
   // a place found by the search: a city opens as if clicked; a country or another place is flown to (a place with a pin
   // and its weather now)
@@ -217,10 +239,9 @@ export function App() {
     if (hit.kind === "city") { onCity(hit.id); return }
     setSelected(null)
     setIssOpen(false)
-    follow(false)
     setPin(hit.kind === "place" ? hit : null)
     controller.flyTo({ lon: hit.lon, lat: clampLat(hit.lat), zoom: Math.max(controller.camera.zoom, hit.kind === "country" ? COUNTRY_ZOOM : PLACE_ZOOM) })
-  }, [controller, onCity, follow])
+  }, [controller, onCity])
   useEffect(() => {
     setPinWeather(null)
     if (!pin) return
@@ -231,28 +252,6 @@ export function App() {
   const pinMark = useMemo(() => (pin ? { lat: pin.lat, lon: pin.lon, name: pin.name } : null), [pin])
 
   const openIss = useCallback(() => { setIssOpen(true); setSelected(null); setPin(null) }, [])
-  // following the ISS: a flight to it, then the camera kept over it — until the user moves the camera, or anything else
-  // sends it somewhere (the ref stops a step already due before the effect is cleaned up)
-  useEffect(() => {
-    if (!following || !issLive) return
-    let live = true, started = false, id = 0, put: GlobeCamera | null = null
-    const step = () => {
-      if (!live || !followRef.current) return
-      // a hidden page is not followed (each move would draw the globe); it picks up where the ISS is when seen again
-      if (document.hidden) { id = window.setTimeout(step, FOLLOW_MS); return }
-      const cam = controller.camera
-      if (put && (Math.abs(cam.lat - put.lat) > FOLLOW_SLIP_DEG || Math.abs(wrapLon(cam.lon - put.lon)) > FOLLOW_SLIP_DEG)) { follow(false); return }
-      const s = issAt(issLive, Date.now())
-      put = { lon: s.lon, lat: clampLat(s.lat), zoom: cam.zoom }
-      controller.set(put)
-      id = window.setTimeout(step, FOLLOW_MS)
-    }
-    const s = issAt(issLive, Date.now() + FOLLOW_START_MS)
-    controller.flyTo({ lon: s.lon, lat: clampLat(s.lat), zoom: Math.max(controller.camera.zoom, FOLLOW_ZOOM) }, () => { started = true; step() })
-    // a flight cut short (the user took the camera) never lands: then there is nothing to follow from
-    const cut = window.setTimeout(() => { if (!started) follow(false) }, FOLLOW_START_MS)
-    return () => { live = false; window.clearTimeout(id); window.clearTimeout(cut) }
-  }, [following, issLive, controller, follow])
 
   const city: City | undefined = selected ? CITY_BY_ID.get(selected) : undefined
   const cw = city ? byId.get(city.id) : undefined
@@ -269,35 +268,47 @@ export function App() {
   const showDock = musicMode || music.track != null
   const issPanel = issOpen && issLive != null
   const panelShown = issPanel || city != null || pin != null
-  const avoid = useMemo(() => [...grow(showDock ? dockBox : null, PANEL_MARGIN_PX), ...grow(panelShown ? panelBox : null, PANEL_MARGIN_PX), ...grow(searchBox, PANEL_MARGIN_PX)],
-    [showDock, dockBox, panelShown, panelBox, searchBox])
+  const avoid = useMemo(() => [...grow(showDock ? dockBox : null, PANEL_MARGIN_PX), ...grow(panelShown ? panelBox : null, PANEL_MARGIN_PX), ...grow(searchBox, PANEL_MARGIN_PX),
+    ...grow(cornerBox, PANEL_MARGIN_PX)], [showDock, dockBox, panelShown, panelBox, searchBox, cornerBox])
+  // what each layer shows now (in the ⓘ card), and what went wrong (small notes at the bottom left)
+  const status = [
+    gpu !== false && showClouds ? satCaption(sat) : null,
+    windOn ? windCaption(wind, windFrame != null, now) : null,
+    detailLine,
+    showIss && issLive ? `The ISS: placed from its orbital elements of ${utcDay(issLive.epochMs)}` : null,
+  ].filter((s): s is string => s != null)
+  const warnings = [
+    gpu === false ? "WebGL2 is unavailable: showing the plain outline globe." : null,
+    weather.error ? `Weather: ${weather.error}` : null,
+    windOn && !windFrame && wind.error && wind.reading == null ? `Wind: forecast unavailable (${wind.error})` : null,
+    showIss && !issLive && issTle.error ? `ISS: its orbit could not be read (${issTle.error})` : null,
+  ].filter((s): s is string => s != null)
 
   return (
     <div className="app">
       <header className="bar">
         <h1>Weather Globe</h1>
         <nav className="tools" aria-label="Globe controls">
-          {REGIONS.map(([name, cam]) => <button key={name} type="button" className="chip" onClick={() => { follow(false); controller.flyTo(cam) }}>{name}</button>)}
-          <button type="button" className={`chip${touring ? " on" : ""}`} aria-pressed={touring} onClick={() => { follow(false); controller.setTouring(!touring) }}>Tour</button>
+          <Menu label="Regions" title="Fly to a part of the world" items={REGIONS.map(([name, cam]) => ({ key: name, label: name, onSelect: () => controller.flyTo(cam) }))} />
+          <button type="button" className={`chip${touring ? " on" : ""}`} aria-pressed={touring} onClick={() => { tourAsked.current = !touring; controller.setTouring(!touring) }}>Tour</button>
           <button ref={musicChip} type="button" className={`chip chip-music${musicMode ? " on" : ""}`} aria-pressed={musicMode} onClick={() => setMusicMode((v) => !v)}
             title="Songs from around the world">♪ Music</button>
-          <button type="button" className={`chip${showClouds ? " on" : ""}`} aria-pressed={showClouds} onClick={() => setShowClouds((v) => !v)} disabled={gpu === false}>Clouds</button>
-          <button type="button" className={`chip${showWind ? " on" : ""}`} aria-pressed={showWind} onClick={switchWind} disabled={gpu === false}
-            title="The wind near the ground, from the weather forecast">Wind</button>
-          <button type="button" className={`chip${showIss ? " on" : ""}`} aria-pressed={showIss} onClick={switchIss} title="The International Space Station, live">ISS</button>
+          <Menu label="Layers" title="What the globe shows" items={[
+            { key: "clouds", label: "Clouds", checked: showClouds && gpu !== false, disabled: gpu === false, onSelect: () => setShowClouds((v) => !v) },
+            { key: "wind", label: "Wind", checked: showWind && gpu !== false, disabled: gpu === false, onSelect: switchWind },
+            { key: "iss", label: "The ISS", checked: showIss, onSelect: switchIss },
+          ]} />
           <button type="button" className="chip" onClick={switchUnit} aria-label={`Show temperatures in °${unit === "C" ? "F" : "C"}`}>°{unit}</button>
-          <button type="button" className="chip" aria-label="Zoom in" onClick={() => controller.set(zoomed(controller.camera, 1.5))}>+</button>
-          <button type="button" className="chip" aria-label="Zoom out" onClick={() => controller.set(zoomed(controller.camera, 1 / 1.5))}>−</button>
         </nav>
       </header>
       <main className={`stage${musicMode ? " music-mode" : ""}`}>
         <Globe cities={cities} clouds={weather.grid} satellite={showClouds ? satellite : null} selected={selected} onCity={onCity}
           controller={controller} showClouds={showClouds && gpu !== false} tiles={tiles} onGpu={setGpu} onDetail={setDetail} reserveBottom={CAPTION_PX}
-          musicMode={musicMode} playing={trackCity} avoid={avoid} wind={windFrame} pin={pinMark} iss={showIss ? issLive : null} issSelected={issOpen} onIss={openIss} />
+          musicMode={musicMode} playing={trackCity} avoid={avoid} wind={windFrame} pin={pinMark} iss={showIss ? issLive : null} issSelected={issOpen} onIss={openIss} issClock={issClock} />
         <div ref={searchRef} className="stage-search"><SearchBox onPick={onPick} /></div>
         {issPanel ? (
-          <IssPanel el={issLive} pick={dayPick} unit={unit} music={music} following={following} onFollow={() => follow(!following)}
-            onFly={findCity} onClose={() => { setIssOpen(false); follow(false) }} boxRef={panelRef} />
+          <IssPanel el={issLive} pick={dayPick} unit={unit} music={music} mode={followMode} clock={issClock} onFollow={follow}
+            onFly={findCity} onClose={() => { setIssOpen(false); follow(null) }} boxRef={panelRef} />
         ) : city ? (
           <aside ref={panelRef} className="panel" aria-label={`${city.name} weather`}>
             <button type="button" className="close" aria-label="Close" onClick={() => setSelected(null)}>×</button>
@@ -323,25 +334,16 @@ export function App() {
         ) : null}
         {showDock && <MusicDock music={music} place={place} onClose={closeMusic} onFind={findCity} boxRef={dockRef} daySong={dayPick?.track ?? null} />}
         <footer className="caption">
-          {gpu === false && <div>WebGL2 is unavailable: showing the plain outline globe.</div>}
-          {gpu !== false && showClouds && <div>{satCaption(sat)}</div>}
-          {windOn && <div className="wind-line">{windCaption(wind, windFrame != null, now)}{windFrame && <WindLegend unit={unit} />}</div>}
-          {detailLine && <div>{detailLine}</div>}
-          {weather.error && <div className="warn">Weather: {weather.error}</div>}
-          {showIss && !issLive && (
-            <div className={issTle.error ? "warn" : undefined}>
-              {issTle.error ? `ISS: its orbit could not be read (${issTle.error})` : issEl ? "ISS: its orbit is out of date; reading it again…" : "ISS: reading its orbit…"}
-            </div>
-          )}
-          <div className="credit">
-            Imagery: <a href="https://earthdata.nasa.gov/gibs" target="_blank" rel="noopener noreferrer">NASA EOSDIS GIBS</a> ·{" "}
-            <a href="https://nowcoast.noaa.gov/" target="_blank" rel="noopener noreferrer">NOAA nowCOAST</a> · Weather data by{" "}
-            <a href="https://open-meteo.com/" target="_blank" rel="noopener noreferrer">Open-Meteo.com</a> (CC BY 4.0) · Land:{" "}
-            <a href="https://www.naturalearthdata.com/" target="_blank" rel="noopener noreferrer">Natural Earth</a>
-            {showIss && <> · ISS: <a href="https://wheretheiss.at/" target="_blank" rel="noopener noreferrer">wheretheiss.at</a></>}
-            {showDock && <> · Music previews: <a href="https://www.apple.com/apple-music/" target="_blank" rel="noopener noreferrer">Apple Music</a>, photos: Deezer</>}
-          </div>
+          {warnings.map((w) => <div key={w} className="toast warn">{w}</div>)}
+          {windOn && windFrame && <WindLegend unit={unit} />}
         </footer>
+        <div ref={cornerRef} className="corner">
+          <div className="zoom" role="group" aria-label="Zoom">
+            <button type="button" className="zoom-button" aria-label="Zoom in" onClick={() => controller.set(zoomed(controller.camera, 1.5))}>+</button>
+            <button type="button" className="zoom-button" aria-label="Zoom out" onClick={() => controller.set(zoomed(controller.camera, 1 / 1.5))}>−</button>
+          </div>
+          <InfoPanel status={status} showIss={showIss} showMusic={showDock} />
+        </div>
       </main>
     </div>
   )

@@ -16,7 +16,8 @@ import { TIER_ZOOM, type CityTier } from "../data/cities"
 import { PACE_START, paceFrame } from "./framePace"
 import { WindView } from "../globe/windView"
 import type { WindFrame } from "../globe/windField"
-import { groundTrack, issAt, type Elements } from "../geo/orbit"
+import { groundTrack, issAt, issFrame, type Elements } from "../geo/orbit"
+import { IssGl, ISS_CANVAS_PX } from "../globe/issGl"
 import { EARTH_KM, smallCircle } from "../geo/distance"
 
 // The globe, in three layers on one orthographic projection (screen pixels):
@@ -82,8 +83,8 @@ const DPR_STEP = 0.25
 const MOVING_MS = 100
 /** the ISS's path drawn behind it and ahead of it (minutes), a point every ISS_TRACK_STEP_MS, worked out afresh every
  *  ISS_TRACK_EVERY_MS */
-const ISS_PAST_MIN = 25
-const ISS_NEXT_MIN = 95
+const ISS_PAST_MIN = 10
+const ISS_NEXT_MIN = 45
 const ISS_TRACK_STEP_MS = 40_000
 const ISS_TRACK_EVERY_MS = 60_000
 /** the ISS crosses the globe this fast (rad/s: once round in ~93 minutes); it is moved on when it has gone ISS_STEP_PX on
@@ -97,6 +98,8 @@ const ISS_FOOT_STEPS = 72
 /** the station grows a little as the camera closes in: this much a step of zoom, up to ISS_SCALE_MAX */
 const ISS_SCALE_PER_ZOOM = 0.12
 const ISS_SCALE_MAX = 1.6
+/** the 3D station's size at the whole-globe view, CSS px a metre (its 107 m truss ~64 px) */
+const ISS_PX_PER_M = 0.6
 /** the station's solar arrays: four wings each side of the truss, each a pair up and down it (its drawing's units) */
 const ISS_ARRAY_X = [-21, -14.6, 9, 15.4]
 const ISS_ARRAYS = ISS_ARRAY_X.map((x) => `M${x} -11h5.6v9.4h-5.6zM${x} 1.6h5.6v9.4h-5.6z`).join("")
@@ -140,6 +143,8 @@ interface Props {
   /** the ISS's panel is open: the station is marked as chosen */
   issSelected?: boolean
   onIss?: () => void
+  /** the ISS's clock (ms): the real one unless a time-lapse ride runs it faster */
+  issClock?: () => number
 }
 
 type Vec3 = [number, number, number]
@@ -163,7 +168,7 @@ const abs = (b: LabelBox, x: number, y: number): LabelBox => [x + b[0], y + b[1]
 const hideCity = (c: CityEls) => { c.g.style.display = "none"; if (c.pill) c.pill.style.display = "none" }
 
 export const Globe = memo(function Globe({ cities, clouds, satellite, selected, onCity, controller, showClouds, tiles, onGpu, onDetail, reserveBottom = 0,
-  musicMode = false, playing = null, avoid = NO_BOXES, wind = null, pin = null, iss = null, issSelected = false, onIss }: Props) {
+  musicMode = false, playing = null, avoid = NO_BOXES, wind = null, pin = null, iss = null, issSelected = false, onIss, issClock }: Props) {
   const stageRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const svgRef = useRef<SVGSVGElement>(null)
@@ -184,6 +189,9 @@ export const Globe = memo(function Globe({ cities, clouds, satellite, selected, 
   const issGroundRef = useRef<SVGCircleElement>(null)
   /** rings round the ISS while its panel is open (HTML: the compositor scales them) */
   const issBeaconRef = useRef<HTMLDivElement>(null)
+  /** the station in 3D (issGl.ts), on a small canvas of its own; null where WebGL2 is not to be had (the drawn one stays) */
+  const issCanvasRef = useRef<HTMLCanvasElement>(null)
+  const issGl = useRef<IssGl | null>(null)
   const issTrack = useRef<{ el: Elements; at: number; pts: Array<{ lat: number; lon: number; tMs: number }> } | null>(null)
   const [dprCap, setDprCap] = useState(DPR_MAX)
   const [size, setSize] = useState({ w: 0, h: 0 })
@@ -252,8 +260,8 @@ export const Globe = memo(function Globe({ cities, clouds, satellite, selected, 
   const night = useMemo(() => new Set(cities.filter((c) => sunCosAt(c.lat, c.lon, sun) < NIGHT_COS).map((c) => c.id)), [cities, sun])
 
   // everything layout() needs from the latest render
-  const data = useRef({ showClouds, selected, sun, pillW, chipW, w, h, dpr, reserveBottom, musicMode, playing, avoid, pin, iss, issSelected, gl: null as GlobeGl | null })
-  data.current = { showClouds, selected, sun, pillW, chipW, w, h, dpr, reserveBottom, musicMode, playing, avoid, pin, iss, issSelected, gl: gl && gl !== "none" ? gl : null }
+  const data = useRef({ showClouds, selected, sun, pillW, chipW, w, h, dpr, reserveBottom, musicMode, playing, avoid, pin, iss, issSelected, issClock, gl: null as GlobeGl | null })
+  data.current = { showClouds, selected, sun, pillW, chipW, w, h, dpr, reserveBottom, musicMode, playing, avoid, pin, iss, issSelected, issClock, gl: gl && gl !== "none" ? gl : null }
   const els = useRef(new Map<string, CityEls>())
   /** where each label sat a moment ago (full pills and compact chips apart), so it holds its place as the globe moves */
   const sidesRef = useRef(new Map<string, LabelSide>())
@@ -284,10 +292,11 @@ export const Globe = memo(function Globe({ cities, clouds, satellite, selected, 
     const g = issRef.current, craft = issCraftRef.current, past = issPastRef.current, next = issNextRef.current
     const foot = issFootRef.current, plumb = issPlumbRef.current, ground = issGroundRef.current, beacon = issBeaconRef.current
     if (!g || !craft || !past || !next || !foot || !plumb || !ground || !beacon) return
-    const el = d.iss, now = Date.now()
+    const el = d.iss, now = d.issClock ? d.issClock() : Date.now()
     const here = el && d.w ? issAt(el, now) : null
     if (!el || !here) {
       g.style.display = ground.style.display = beacon.style.display = "none"
+      if (issCanvasRef.current) issCanvasRef.current.style.display = "none"
       for (const e of [past, next, foot, plumb]) e.setAttribute("d", "")
       return
     }
@@ -298,7 +307,7 @@ export const Globe = memo(function Globe({ cities, clouds, satellite, selected, 
       return z < 0 && (x * x + y * y) * k * k < 1 ? null : [cx + r * k * x, cy - r * k * y]
     }
     let tr = issTrack.current
-    if (!tr || tr.el !== el || now - tr.at > ISS_TRACK_EVERY_MS) {
+    if (!tr || tr.el !== el || Math.abs(now - tr.at) > ISS_TRACK_EVERY_MS) {
       tr = { el, at: now, pts: groundTrack(el, now - ISS_PAST_MIN * 60_000, now + ISS_NEXT_MIN * 60_000, ISS_TRACK_STEP_MS) }
       issTrack.current = tr
     }
@@ -315,24 +324,34 @@ export const Globe = memo(function Globe({ cities, clouds, satellite, selected, 
     }
     past.setAttribute("d", path([...tr.pts.filter((q) => q.tMs < now), here], aloft))
     next.setAttribute("d", path([here, ...tr.pts.filter((q) => q.tMs > now)], aloft))
-    // the ground its crew can see: within the horizon from its height
-    foot.setAttribute("d", path(smallCircle(here.lat, here.lon, Math.acos(1 / k), ISS_FOOT_STEPS), at, true))
+    // the ground its crew can see (within the horizon from its height), while it is chosen
+    foot.setAttribute("d", d.issSelected ? path(smallCircle(here.lat, here.lon, Math.acos(1 / k), ISS_FOOT_STEPS), at, true) : "")
     const p = aloft(here.lat, here.lon), gp = at(here.lat, here.lon)
     g.style.display = p ? "" : "none"
     ground.style.display = gp ? "" : "none"
     if (gp) { ground.setAttribute("cx", gp[0].toFixed(1)); ground.setAttribute("cy", gp[1].toFixed(1)) }
     plumb.setAttribute("d", p && gp ? `M${p[0].toFixed(1)} ${p[1].toFixed(1)}L${gp[0].toFixed(1)} ${gp[1].toFixed(1)}` : "")
     beacon.style.display = p && d.issSelected ? "" : "none"
+    const cv = issCanvasRef.current, gl3 = issGl.current
+    if (cv) cv.style.display = p && gl3 ? "" : "none"
     if (!p) return
     const grow = Math.min(ISS_SCALE_MAX, 1 + (cam.zoom - 1) * ISS_SCALE_PER_ZOOM)
     g.setAttribute("transform", `translate(${p[0].toFixed(1)} ${p[1].toFixed(1)}) scale(${grow.toFixed(2)})`)
     if (d.issSelected) beacon.style.transform = `translate3d(${p[0].toFixed(1)}px, ${p[1].toFixed(1)}px, 0)`
-    // its truss across its path, as the real one flies
-    const ahead = issAt(el, now + 20_000), q = aloft(ahead.lat, ahead.lon)
-    if (q) craft.setAttribute("transform", `rotate(${(Math.atan2(q[0] - p[0], p[1] - q[1]) / RAD).toFixed(1)})`)
     // in the Earth's shadow (behind the Earth from the sun, inside the shadow's cylinder) the station dims
     const s = unit(d.sun.lat, d.sun.lon), u = unit(here.lat, here.lon), along = k * (u[0] * s[0] + u[1] * s[1] + u[2] * s[2])
-    g.classList.toggle("eclipsed", along < 0 && k * k - along * along < 1)
+    const dark = along < 0 && k * k - along * along < 1
+    g.classList.toggle("eclipsed", dark)
+    if (gl3 && cv) {
+      // the station in 3D, in its real attitude as it flies, lit by the sun
+      const f = issFrame(el, now), c = (v: readonly [number, number, number]) => toCam([v[0], v[1], v[2]], cam)
+      gl3.draw({ forward: c(f.forward), truss: c(f.truss), nadir: c(f.nadir), sun: c(s), lit: !dark, pxPerM: ISS_PX_PER_M * grow, dpr: d.dpr })
+      cv.style.transform = `translate3d(${(p[0] - ISS_CANVAS_PX / 2).toFixed(1)}px, ${(p[1] - ISS_CANVAS_PX / 2).toFixed(1)}px, 0)`
+      return
+    }
+    // without WebGL, the drawn station: its truss across its path, as the real one flies
+    const ahead = issAt(el, now + 20_000), q = aloft(ahead.lat, ahead.lon)
+    if (q) craft.setAttribute("transform", `rotate(${(Math.atan2(q[0] - p[0], p[1] - q[1]) / RAD).toFixed(1)})`)
   }, [controller])
 
   /** Writes the current camera's positions into the elements, and draws the GPU layer. */
@@ -534,6 +553,29 @@ export const Globe = memo(function Globe({ cities, clouds, satellite, selected, 
     if (wind) layout()
   }, [wind, gl, layout])
   useEffect(() => () => { windView.current?.dispose(); windView.current = null }, [])
+  // the 3D station, on its own canvas: made the first time the ISS is shown (the drawn one stands in without WebGL2)
+  useEffect(() => {
+    if (!iss || issGl.current || !issCanvasRef.current) return
+    issGl.current = IssGl.create(issCanvasRef.current)
+    issCraftRef.current?.style.setProperty("display", issGl.current ? "none" : "")
+    placeOverlays()
+  }, [iss, placeOverlays])
+  useEffect(() => () => { issGl.current?.dispose(); issGl.current = null }, [])
+  // its context lost (a GPU reset), the drawn station stands in until the context is back
+  useEffect(() => {
+    const cv = issCanvasRef.current
+    if (!cv) return
+    const show = (gl3: IssGl | null) => {
+      issGl.current = gl3
+      issCraftRef.current?.style.setProperty("display", gl3 ? "none" : "")
+      placeOverlays()
+    }
+    const lost = (e: Event) => { e.preventDefault(); show(null) }
+    const restored = () => show(IssGl.create(cv))
+    cv.addEventListener("webglcontextlost", lost)
+    cv.addEventListener("webglcontextrestored", restored)
+    return () => { cv.removeEventListener("webglcontextlost", lost); cv.removeEventListener("webglcontextrestored", restored) }
+  }, [placeOverlays])
   // the ISS moves on by itself: it (and the pin) are placed again — never the globe drawn again
   useEffect(() => {
     placeOverlays()
@@ -648,8 +690,8 @@ export const Globe = memo(function Globe({ cities, clouds, satellite, selected, 
           aria-label="The International Space Station" onClick={() => onIss?.()}
           onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onIss?.() } }}>
           <title>The International Space Station, live: where it is, and the song of the day it picked</title>
-          <circle className="iss-hit" r={24} />
-          <circle className="iss-halo" r={22} />
+          <circle className="iss-hit" r={30} />
+          <circle className="iss-halo" r={36} />
           <g ref={issCraftRef} className="iss-craft">
             <path className="iss-array" d={ISS_ARRAYS} />
             <path className="iss-cells" d={ISS_CELLS} />
@@ -659,7 +701,7 @@ export const Globe = memo(function Globe({ cities, clouds, satellite, selected, 
             <rect className="iss-module" x={-5} y={-4.4} width={10} height={2.6} rx={1.3} />
             <path className="iss-array small" d="M-6.8 7.4h4.4v1.8h-4.4zM2.4 7.4h4.4v1.8H2.4z" />
           </g>
-          <g className="iss-tag" transform="translate(27 0)">
+          <g className="iss-tag" transform="translate(34 -26)">
             <rect x={0} y={-7.5} width={28} height={15} rx={7.5} />
             <text x={14} y={3.4} textAnchor="middle">ISS</text>
           </g>
@@ -667,6 +709,7 @@ export const Globe = memo(function Globe({ cities, clouds, satellite, selected, 
       </svg>
       <div ref={wavesRef} className="playing-waves" style={{ display: "none" }} aria-hidden="true"><i /><i /><i /></div>
       <div ref={issBeaconRef} className="iss-beacon" style={{ display: "none" }} aria-hidden="true"><i /><i /></div>
+      <canvas ref={issCanvasRef} className="iss-3d" style={{ display: "none", width: ISS_CANVAS_PX, height: ISS_CANVAS_PX }} aria-hidden="true" />
       <div ref={pillsRef} className="globe-pills">
         {cities.map((c) => {
           const temp = c.temp?.text ?? null
