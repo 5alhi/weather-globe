@@ -18,6 +18,15 @@
 html, body, #root { height: 100%; margin: 0; }
 body { background: var(--bg-0); color: var(--ink-2); font-family: var(--sans); font-size: 14px; -webkit-font-smoothing: antialiased; }
 button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+
+/* what the page is, in index.html, until the app replaces it on load */
+.about { box-sizing: border-box; max-width: 44rem; margin: 0 auto; padding: 9vh 24px 48px; line-height: 1.6; color: var(--ink-3); }
+.about h1 { margin: 0 0 6px; font-size: 22px; font-weight: 700; letter-spacing: 0.02em; color: var(--ink-1); }
+.about h2 { margin: 26px 0 6px; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-4); }
+.about p, .about ul { margin: 0 0 10px; }
+.about ul { padding-left: 18px; }
+.about a { color: var(--ink-2); }
+.about .about-loading { color: var(--accent); }
 a { color: var(--ink-2); }
 
 .app { display: flex; flex-direction: column; height: 100%; }
@@ -210,6 +219,7 @@ a { color: var(--ink-2); }
 .info-card ul:last-child { margin-bottom: 0; }
 .info-card li { margin: 3px 0; }
 .info-card a { color: var(--ink-1); }
+.info-card .info-privacy { margin: 0; font-size: 11px; line-height: 1.5; color: var(--ink-4); }
 /* the bottom left: only what went wrong, and the wind's scale while it shows */
 .caption { right: auto; max-width: calc(100% - 140px); }
 .toast { align-self: flex-start; padding: 5px 10px; border-radius: 10px; background: rgba(8, 11, 32, 0.86); }
