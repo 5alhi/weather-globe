@@ -95,6 +95,8 @@
 .dock-world { display: inline-flex; align-items: center; gap: 8px; height: 36px; margin-top: 12px; padding: 0 16px; border-radius: 18px; font-size: 13px; font-weight: 700; color: #fff;
   background: linear-gradient(135deg, var(--s1), var(--s2)); box-shadow: 0 8px 22px rgba(228, 87, 46, 0.35); transition: transform 160ms; }
 .dock-world:hover { transform: translateY(-1px); }
+/* the song of the day beside it: the same shape, outlined */
+.dock-world.dock-day { margin-left: 8px; background: transparent; border: 1px solid rgba(244, 185, 66, 0.6); color: #f6d48c; box-shadow: none; }
 .dock-world .ic { width: 16px; height: 16px; }
 
 .dock-deck { display: block; max-width: 290px; margin: 14px auto 6px; filter: drop-shadow(0 16px 22px rgba(0, 0, 0, 0.55)); }
@@ -192,9 +194,16 @@
 @media (max-height: 760px) { .dock-deck { max-width: 230px; margin-top: 10px; } }
 @media (max-height: 640px) { .dock-deck { display: none; } }
 @media (max-width: 640px) {
-  .dock { left: 8px; right: 8px; bottom: 70px; width: auto; max-width: none; padding: 12px 12px 10px; }
+  /* just above the credits (styles.css), over the notes and the wind's scale while it plays; out of the way (and of
+     Tab) while a city's sheet takes its place, which has its own songs */
+  .dock { left: 8px; right: 8px; bottom: 42px; width: auto; max-width: none; padding: 12px 12px 10px; }
+  .panel-open .dock { visibility: hidden; }
   .dock.folded { width: auto; }
   .dock-deck { max-width: 210px; }
   .dock-now { grid-template-columns: 64px 1fr; }
   .dock-cover { width: 64px; height: 64px; }
+}
+/* a phone on its side: the player at the bottom left as on a computer, clear of the zoom at the bottom right */
+@media (max-height: 500px) and (orientation: landscape) {
+  .dock { left: 16px; right: auto; bottom: 72px; width: 360px; max-width: calc(100% - 80px); }
 }
