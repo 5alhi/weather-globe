@@ -1,9 +1,9 @@
-# Keeps this fork's main in step with vazyvazy123/weather-globe: once a day, or by hand from the Actions tab.
+# Keeps this fork's main in step with vazyvazy123/weather-globe: every hour, or by hand from the Actions tab.
 # If upstream changes a workflow file, this token may not merge it; use the "Sync fork" button on the repo page instead.
 name: sync from upstream
 on:
   schedule:
-    - cron: "30 16 * * *"
+    - cron: "7 * * * *"
   workflow_dispatch:
 permissions:
   contents: write
